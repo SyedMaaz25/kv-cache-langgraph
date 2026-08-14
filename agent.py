@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from tools import ALL_TOOLS, set_root_dir
 from metrics import AgentMetrics
+from datetime import datetime
 
 load_dotenv()
 
@@ -120,7 +121,84 @@ class KVCacheAgentCorrect:
         metrics.total_time = time.time() - start
         return metrics
 
+class KVCacheAgentDynamicSystem:
+    """Anti-pattern: injects a timestamp into the system prompt every request,
+    so the prefix changes on every call -> cache invalidation."""
+
+    def __init__(self, root_dir: str = ".", max_iterations: int = 6):
+        self.client = OpenAI()
+        set_root_dir(root_dir)
+        self.max_iterations = max_iterations
+        # NOTE: no fixed system message stored here it's rebuilt every call.
+        self.history = []  # user/assistant/tool turns only, system excluded
+
+    def _build_system_message(self) -> dict:
+        return {
+            "role": "system",
+            "content": f"{SYSTEM_PROMPT}\n\nCurrent time: {datetime.now().isoformat()}",
+        }
+
+    def run(self, task: str) -> AgentMetrics:
+        metrics = AgentMetrics(mode="dynamic_system")
+        start = time.time()
+
+        self.history.append({"role": "user", "content": task})
+
+        for _ in range(self.max_iterations):
+            # Rebuild the full messages list from scratch each iteration,
+            # with a fresh system prompt -> breaks the stable prefix.
+            messages = [self._build_system_message()] + self.history
+
+            iter_start = time.time()
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+            )
+            ttft = time.time() - iter_start
+
+            usage = response.usage
+            cached = 0
+            if usage.prompt_tokens_details:
+                cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+
+            metrics.record_iteration(ttft, {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached,
+            })
+
+            msg = response.choices[0].message
+            self.history.append(msg.model_dump(exclude_none=True))
+
+            if not msg.tool_calls:
+                metrics.total_time = time.time() - start
+                print(f"\nFinal answer:\n{msg.content}")
+                return metrics
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                tool_fn = TOOLS_BY_NAME.get(fn_name)
+                result = tool_fn.invoke(args) if tool_fn else f"Error: unknown tool {fn_name}"
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        metrics.total_time = time.time() - start
+        return metrics
+
 if __name__ == "__main__":
-    agent = KVCacheAgentCorrect(root_dir=".")
-    metrics = agent.run("Find all .py files and summarize what tools.py does in 2 sentences.")
-    print("\n" + metrics.summary())
+    task = "Find all .py files and summarize what tools.py does in 2 sentences."
+
+    print("=== CORRECT ===")
+    agent1 = KVCacheAgentCorrect(root_dir=".")
+    m1 = agent1.run(task)
+    print("\n" + m1.summary())
+
+    print("\n=== DYNAMIC_SYSTEM ===")
+    agent2 = KVCacheAgentDynamicSystem(root_dir=".")
+    m2 = agent2.run(task)
+    print("\n" + m2.summary())
