@@ -68,7 +68,7 @@ class KVCacheAgentCorrect:
     """Stable-context ReAct agent: fixed system prompt, fixed tool order,
     messages list built once and appended to (never rebuilt) -> cache-friendly."""
 
-    def __init__(self, root_dir: str = ".", max_iterations: int = 6):
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8):
         self.client = OpenAI()
         set_root_dir(root_dir)
         self.max_iterations = max_iterations
@@ -93,6 +93,7 @@ class KVCacheAgentCorrect:
             cached = 0
             if usage.prompt_tokens_details:
                 cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
 
             metrics.record_iteration(ttft, {
                 "prompt_tokens": usage.prompt_tokens,
@@ -126,7 +127,7 @@ class KVCacheAgentDynamicSystem:
     """Anti-pattern: injects a timestamp into the system prompt every request,
     so the prefix changes on every call -> cache invalidation."""
 
-    def __init__(self, root_dir: str = ".", max_iterations: int = 6):
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8):
         self.client = OpenAI()
         set_root_dir(root_dir)
         self.max_iterations = max_iterations
@@ -162,6 +163,7 @@ class KVCacheAgentDynamicSystem:
             cached = 0
             if usage.prompt_tokens_details:
                 cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
 
             metrics.record_iteration(ttft, {
                 "prompt_tokens": usage.prompt_tokens,
@@ -197,7 +199,7 @@ class KVCacheAgentShuffledTools:
     tools list breaks the prefix since it changes what precedes the rest
     of the prompt."""
 
-    def __init__(self, root_dir: str = ".", max_iterations: int = 6):
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8):
         self.client = OpenAI()
         set_root_dir(root_dir)
         self.max_iterations = max_iterations
@@ -227,6 +229,7 @@ class KVCacheAgentShuffledTools:
             cached = 0
             if usage.prompt_tokens_details:
                 cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
 
             metrics.record_iteration(ttft, {
                 "prompt_tokens": usage.prompt_tokens,
@@ -257,7 +260,11 @@ class KVCacheAgentShuffledTools:
         return metrics
 
 if __name__ == "__main__":
-    task = "Find all .py files and summarize what tools.py does in 2 sentences."
+    task = (
+        "Read all files in sample_data/ (there are 5: module_0.py through module_4.py). "
+        "For each one, note what the process_data function and DataProcessor class do. "
+        "Then give a combined summary in 4-5 sentences."
+    )
 
     print("=== CORRECT ===")
     agent1 = KVCacheAgentCorrect(root_dir=".")
