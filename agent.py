@@ -331,6 +331,148 @@ class KVCacheAgentDynamicProfile:
         metrics.total_time = time.time() - start
         return metrics
 
+class KVCacheAgentSlidingWindow:
+    """Anti-pattern: keeps only the last N messages to 'save tokens'.
+    Looks efficient but breaks the stable growing prefix the cache relies on."""
+
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8, window_size: int = 5):
+        self.client = OpenAI()
+        set_root_dir(root_dir)
+        self.max_iterations = max_iterations
+        self.window_size = window_size
+        self.system_message = {"role": "system", "content": SYSTEM_PROMPT}
+        self.history = []
+
+    def _safe_window(self) -> list:
+        """Take the last window_size messages, but if that slice starts mid-way
+        through a tool-call exchange (orphaning a 'tool' message), extend
+        backward to include the assistant message that made the calls."""
+        window = self.history[-self.window_size:]
+        start_idx = len(self.history) - len(window)
+
+        while window and window[0].get("role") == "tool" and start_idx > 0:
+            start_idx -= 1
+            window = self.history[start_idx:]
+
+        return window
+
+    def run(self, task: str) -> AgentMetrics:
+        metrics = AgentMetrics(mode="sliding_window")
+        start = time.time()
+
+        self.history.append({"role": "user", "content": task})
+
+        for _ in range(self.max_iterations):
+            #  system message + only the last `window_size` history messages
+            windowed = self._safe_window()
+            call_messages = [self.system_message] + windowed
+
+            iter_start = time.time()
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=call_messages,
+                tools=TOOL_SCHEMAS,
+            )
+            ttft = time.time() - iter_start
+
+            usage = response.usage
+            cached = 0
+            if usage.prompt_tokens_details:
+                cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
+
+            metrics.record_iteration(ttft, {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached,
+            })
+
+            msg = response.choices[0].message
+            self.history.append(msg.model_dump(exclude_none=True))
+
+            if not msg.tool_calls:
+                metrics.total_time = time.time() - start
+                print(f"\nFinal answer:\n{msg.content}")
+                return metrics
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                tool_fn = TOOLS_BY_NAME.get(fn_name)
+                result = tool_fn.invoke(args) if tool_fn else f"Error: unknown tool {fn_name}"
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        metrics.total_time = time.time() - start
+        return metrics
+
+class KVCacheAgentTextFormat:
+    """Anti-pattern: flattens the whole conversation into one plain-text blob
+    per call instead of using structured messages -> breaks the API's expected
+    format and any prefix caching tied to structured message boundaries."""
+
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8):
+        self.client = OpenAI()
+        set_root_dir(root_dir)
+        self.max_iterations = max_iterations
+        self.history = []  # list of (role, content) tuples
+
+    def _render_as_text(self, task: str) -> str:
+        lines = [SYSTEM_PROMPT, "", f"User task: {task}", ""]
+        for role, content in self.history:
+            lines.append(f"[{role.upper()}]: {content}")
+        return "\n".join(lines)
+
+    def run(self, task: str) -> AgentMetrics:
+        metrics = AgentMetrics(mode="text_format")
+        start = time.time()
+
+        for _ in range(self.max_iterations):
+            # Rebuiling the ENTIRE conversation as one flat text blob each call
+            flat_text = self._render_as_text(task)
+            call_messages = [{"role": "user", "content": flat_text}]
+
+            iter_start = time.time()
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=call_messages,
+                tools=TOOL_SCHEMAS,
+            )
+            ttft = time.time() - iter_start
+
+            usage = response.usage
+            cached = 0
+            if usage.prompt_tokens_details:
+                cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
+
+            metrics.record_iteration(ttft, {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached,
+            })
+
+            msg = response.choices[0].message
+            self.history.append(("assistant", msg.content or "(tool call)"))
+
+            if not msg.tool_calls:
+                metrics.total_time = time.time() - start
+                print(f"\nFinal answer:\n{msg.content}")
+                return metrics
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                tool_fn = TOOLS_BY_NAME.get(fn_name)
+                result = tool_fn.invoke(args) if tool_fn else f"Error: unknown tool {fn_name}"
+                self.history.append(("tool_result", f"{fn_name}({args}) -> {result}"))
+
+        metrics.total_time = time.time() - start
+        return metrics
+
 if __name__ == "__main__":
     task = (
         "Read all files in sample_data/ (there are 5: module_0.py through module_4.py). "
@@ -357,3 +499,13 @@ if __name__ == "__main__":
     agent4 = KVCacheAgentDynamicProfile(root_dir=".")
     m4 = agent4.run(task)
     print("\n" + m4.summary())
+
+    print("\n=== SLIDING_WINDOW ===")
+    agent5 = KVCacheAgentSlidingWindow(root_dir=".")
+    m5 = agent5.run(task)
+    print("\n" + m5.summary())
+
+    print("\n=== TEXT_FORMAT ===")
+    agent6 = KVCacheAgentTextFormat(root_dir=".")
+    m6 = agent6.run(task)
+    print("\n" + m6.summary())
