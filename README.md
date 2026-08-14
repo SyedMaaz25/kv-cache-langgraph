@@ -1,4 +1,4 @@
-# KV Cache Demonstration (LangChain/langchain + OpenAI)
+# KV Cache Demonstration (LangChain + OpenAI)
 
 A ReAct-style agent with local filesystem tools that demonstrates how OpenAI's
 prompt caching (KV cache) behaves under six implementation patterns one
