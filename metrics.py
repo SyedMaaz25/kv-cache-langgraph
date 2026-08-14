@@ -1,5 +1,7 @@
 import time
 from dataclasses import dataclass, field
+import json as _json
+from pathlib import Path
 
 @dataclass
 class AgentMetrics:
@@ -43,3 +45,37 @@ class AgentMetrics:
             f"Cache ratio: {self.cache_ratio:.1f}%",
         ]
         return "\n".join(lines)
+
+def save_metrics(metrics: "AgentMetrics", output_path: str = None) -> str:
+    if output_path is None:
+        output_path = f"result_{metrics.mode}_{int(time.time())}.json"
+    data = {
+        "mode": metrics.mode,
+        "iterations": metrics.iterations,
+        "ttft_per_iter": metrics.ttft_per_iter,
+        "total_time": metrics.total_time,
+        "prompt_tokens": metrics.prompt_tokens,
+        "completion_tokens": metrics.completion_tokens,
+        "cached_tokens": metrics.cached_tokens,
+        "cache_hits": metrics.cache_hits,
+        "hit_rate": metrics.hit_rate,
+        "cache_ratio": metrics.cache_ratio,
+    }
+    Path(output_path).write_text(_json.dumps(data, indent=2))
+    return output_path
+
+def load_metrics(path: str) -> dict:
+    return _json.loads(Path(path).read_text())
+
+def print_comparison_table(results: list) -> None:
+    header = f"{'Mode':<16}{'Iters':<7}{'1st TTFT':<10}{'Avg TTFT':<10}{'Total(s)':<10}{'Prompt':<9}{'Cached':<9}{'Hit%':<7}{'Cache%':<8}"
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        first_ttft = r["ttft_per_iter"][0] if r["ttft_per_iter"] else 0
+        avg_ttft = sum(r["ttft_per_iter"]) / len(r["ttft_per_iter"]) if r["ttft_per_iter"] else 0
+        print(
+            f"{r['mode']:<16}{r['iterations']:<7}{first_ttft:<10.3f}{avg_ttft:<10.3f}"
+            f"{r['total_time']:<10.3f}{r['prompt_tokens']:<9}{r['cached_tokens']:<9}"
+            f"{r['hit_rate']:<7.1f}{r['cache_ratio']:<8.1f}"
+        )
