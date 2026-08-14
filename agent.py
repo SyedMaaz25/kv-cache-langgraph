@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from tools import ALL_TOOLS, set_root_dir
 from metrics import AgentMetrics
 from datetime import datetime
+import random
 
 load_dotenv()
 
@@ -190,6 +191,71 @@ class KVCacheAgentDynamicSystem:
         metrics.total_time = time.time() - start
         return metrics
 
+class KVCacheAgentShuffledTools:
+    """Anti-pattern: randomizes tool definition order every request.
+    Same tools, same system prompt, same messages -- but reordering the
+    tools list breaks the prefix since it changes what precedes the rest
+    of the prompt."""
+
+    def __init__(self, root_dir: str = ".", max_iterations: int = 6):
+        self.client = OpenAI()
+        set_root_dir(root_dir)
+        self.max_iterations = max_iterations
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    def _shuffled_tool_schemas(self) -> list:
+        shuffled = TOOL_SCHEMAS.copy()
+        random.shuffle(shuffled)
+        return shuffled
+
+    def run(self, task: str) -> AgentMetrics:
+        metrics = AgentMetrics(mode="shuffled_tools")
+        start = time.time()
+
+        self.messages.append({"role": "user", "content": task})
+
+        for _ in range(self.max_iterations):
+            iter_start = time.time()
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=self.messages,
+                tools=self._shuffled_tool_schemas(),  # reordered every call
+            )
+            ttft = time.time() - iter_start
+
+            usage = response.usage
+            cached = 0
+            if usage.prompt_tokens_details:
+                cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+
+            metrics.record_iteration(ttft, {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached,
+            })
+
+            msg = response.choices[0].message
+            self.messages.append(msg.model_dump(exclude_none=True))
+
+            if not msg.tool_calls:
+                metrics.total_time = time.time() - start
+                print(f"\nFinal answer:\n{msg.content}")
+                return metrics
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                tool_fn = TOOLS_BY_NAME.get(fn_name)
+                result = tool_fn.invoke(args) if tool_fn else f"Error: unknown tool {fn_name}"
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        metrics.total_time = time.time() - start
+        return metrics
+
 if __name__ == "__main__":
     task = "Find all .py files and summarize what tools.py does in 2 sentences."
 
@@ -202,3 +268,8 @@ if __name__ == "__main__":
     agent2 = KVCacheAgentDynamicSystem(root_dir=".")
     m2 = agent2.run(task)
     print("\n" + m2.summary())
+
+    print("\n=== SHUFFLED_TOOLS ===")
+    agent3 = KVCacheAgentShuffledTools(root_dir=".")
+    m3 = agent3.run(task)
+    print("\n" + m3.summary())
