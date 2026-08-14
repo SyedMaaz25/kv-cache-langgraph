@@ -259,6 +259,78 @@ class KVCacheAgentShuffledTools:
         metrics.total_time = time.time() - start
         return metrics
 
+class KVCacheAgentDynamicProfile:
+    """Anti-pattern: injects a changing user profile/credits block into the
+    prompt every call. Common in production (e.g. showing live usage/balance
+    in context) -- looks harmless but invalidates the cached prefix each time."""
+
+    def __init__(self, root_dir: str = ".", max_iterations: int = 8):
+        self.client = OpenAI()
+        set_root_dir(root_dir)
+        self.max_iterations = max_iterations
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._credits = 1000  # simulating live counter
+
+    def _profile_message(self) -> dict:
+        # Simulating a counter that changes each call (e.g. usage/credits ticking down)
+        self._credits -= random.randint(1, 5)
+        return {
+            "role": "user",
+            "content": f"[User profile: credits_remaining={self._credits}, session_active=true]",
+        }
+
+    def run(self, task: str) -> AgentMetrics:
+        metrics = AgentMetrics(mode="dynamic_profile")
+        start = time.time()
+
+        self.messages.append({"role": "user", "content": task})
+
+        for _ in range(self.max_iterations):
+            # Injecting the changing profile block right before each call
+            call_messages = self.messages + [self._profile_message()]
+
+            iter_start = time.time()
+            response = self.client.chat.completions.create(
+                model=MODEL,
+                messages=call_messages,
+                tools=TOOL_SCHEMAS,
+            )
+            ttft = time.time() - iter_start
+
+            usage = response.usage
+            cached = 0
+            if usage.prompt_tokens_details:
+                cached = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+            print(f"  [iter] prompt_tokens={usage.prompt_tokens} cached_tokens={cached}")
+
+            metrics.record_iteration(ttft, {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached,
+            })
+
+            msg = response.choices[0].message
+            self.messages.append(msg.model_dump(exclude_none=True))
+
+            if not msg.tool_calls:
+                metrics.total_time = time.time() - start
+                print(f"\nFinal answer:\n{msg.content}")
+                return metrics
+
+            for tc in msg.tool_calls:
+                fn_name = tc.function.name
+                args = json.loads(tc.function.arguments)
+                tool_fn = TOOLS_BY_NAME.get(fn_name)
+                result = tool_fn.invoke(args) if tool_fn else f"Error: unknown tool {fn_name}"
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(result),
+                })
+
+        metrics.total_time = time.time() - start
+        return metrics
+
 if __name__ == "__main__":
     task = (
         "Read all files in sample_data/ (there are 5: module_0.py through module_4.py). "
@@ -280,3 +352,8 @@ if __name__ == "__main__":
     agent3 = KVCacheAgentShuffledTools(root_dir=".")
     m3 = agent3.run(task)
     print("\n" + m3.summary())
+
+    print("\n=== DYNAMIC_PROFILE ===")
+    agent4 = KVCacheAgentDynamicProfile(root_dir=".")
+    m4 = agent4.run(task)
+    print("\n" + m4.summary())
